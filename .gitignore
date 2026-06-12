@@ -1,0 +1,21 @@
+# Virtual environment — huge, never upload (recreated from requirements.txt)
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# SECRET — your Gemini API key lives here. MUST never go public.
+.env
+
+# Generated intermediate files (the app recreates these; not needed in the repo)
+procurement_clean.csv
+procurement_classified.csv
+procurement_ai_classified.csv
+procurement_final.csv
+category_analysis.csv
+supplier_profiles.csv
+
+# OS junk
+.DS_Store
+Thumbs.db
