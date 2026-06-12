@@ -47,4 +47,4 @@ Python · Streamlit · pandas · Plotly · RapidFuzz · Google Gemini (google-ge
 *Coming soon — deployed on Streamlit Community Cloud.*
 
 ---
-Built by [Your Name]. Sample data is synthetic and models real steel-plant procurement.
+Built by Deval. Sample data is synthetic and models real steel-plant procurement.
