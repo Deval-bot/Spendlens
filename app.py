@@ -79,7 +79,10 @@ api_key = st.sidebar.text_input("Gemini API key", value=os.getenv("GEMINI_API_KE
 currency = st.sidebar.text_input("Currency symbol (optional)", value="")
 source = st.sidebar.radio("Data source", ["Use sample (steel plant)", "Upload my CSV"])
 
-def load_csv(f):
+def load_file(f):
+    name = f.name if hasattr(f, "name") else str(f)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(f)
     try:
         return pd.read_csv(f)
     except UnicodeDecodeError:
@@ -88,10 +91,10 @@ def load_csv(f):
         return pd.read_csv(f, encoding="latin-1")
 
 if source == "Upload my CSV":
-    up = st.sidebar.file_uploader("Upload procurement CSV", type=["csv"])
-    raw = load_csv(up) if up is not None else None
+    up = st.sidebar.file_uploader("Upload procurement data", type=["csv", "xlsx", "xls"])
+    raw = load_file(up) if up is not None else None
 else:
-    raw = load_csv("procurement_steel.csv")
+    raw = load_file("procurement_steel.csv")
 
 # ================================ HEADER ================================
 st.title("SpendLens")
