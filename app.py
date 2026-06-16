@@ -1,10 +1,11 @@
 """
-app.py — SpendLens: turn ANY messy procurement CSV into spend intelligence.
+app.py — SpendLens: turn ANY messy procurement file into spend intelligence.
 Run with:  python -m streamlit run app.py
 """
 import os, json, re
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
@@ -12,6 +13,19 @@ from rapidfuzz import fuzz
 load_dotenv()
 st.set_page_config(page_title="SpendLens", page_icon="🔎", layout="wide")
 COLORS = {"Leverage": "#2e9e6f", "Strategic": "#e0922f", "Bottleneck": "#d9534f", "Routine": "#7a838f"}
+
+# ============================ FILE LOADING ============================
+def load_file(f):
+    """Read a user file as CSV (utf-8, then latin-1) or Excel."""
+    name = (f.name if hasattr(f, "name") else str(f)).lower()
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(f)
+    try:
+        return pd.read_csv(f)
+    except UnicodeDecodeError:
+        if hasattr(f, "seek"):
+            f.seek(0)
+        return pd.read_csv(f, encoding="latin-1")
 
 # ============================ ENGINE (industry-agnostic) ============================
 NOISE = re.compile(r"\b(ltd|limited|pvt|private|llp|inc|incorporated|corp|corporation|co|company|"
@@ -65,6 +79,48 @@ def analyze(work):
     s["quadrant"] = s.apply(quad, axis=1)
     return s.sort_values("total_spend", ascending=False)
 
+def price_variance(work):
+    """Items bought above their median unit price = recoverable premium (needs qty)."""
+    if "qty" not in work.columns:
+        return None
+    w = work.dropna(subset=["qty"]).copy()
+    w = w[w["qty"] > 0]
+    if w.empty:
+        return None
+    w["unit_price"] = w["amount"] / w["qty"]
+    rows = []
+    for item, g in w.groupby("item_desc"):
+        if len(g) < 2:
+            continue
+        bench = g["unit_price"].median()
+        over = g[g["unit_price"] > bench]
+        savings = ((over["unit_price"] - bench) * over["qty"]).sum()
+        if savings <= 0:
+            continue
+        rows.append({"Item": item, "Orders": len(g), "Suppliers": g["supplier"].nunique(),
+                     "Median unit price": bench, "Max unit price": g["unit_price"].max(),
+                     "Spread": g["unit_price"].max() / g["unit_price"].min(),
+                     "Recoverable": savings})
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values("Recoverable", ascending=False)
+def tail_spend(work, head_share=0.80):
+    """Pareto: a few 'head' suppliers carry ~80% of spend; the rest are the long tail."""
+    spend = work.groupby("supplier")["amount"].sum().sort_values(ascending=False)
+    total = spend.sum()
+    prof = spend.reset_index()
+    prof.columns = ["supplier", "spend"]
+    prof["rank"] = range(1, len(prof) + 1)
+    prof["cum_pct"] = prof["spend"].cumsum() / total
+    crossed = prof["cum_pct"] >= head_share
+    boundary = crossed.idxmax() if crossed.any() else len(prof) - 1
+    prof["segment"] = ["Head" if i <= boundary else "Tail" for i in range(len(prof))]
+    n_head = int((prof["segment"] == "Head").sum())
+    tail_amt = prof.loc[prof["segment"] == "Tail", "spend"].sum()
+    return {"profile": prof, "n_total": len(prof), "n_head": n_head,
+            "n_tail": len(prof) - n_head,
+            "tail_pct_suppliers": (len(prof) - n_head) / len(prof) if len(prof) else 0,
+            "tail_spend": tail_amt, "tail_spend_pct": tail_amt / total if total else 0}
 def fmt(v, sym=""):
     a = abs(v)
     if a >= 1e9: return f"{sym}{v/1e9:.2f}B"
@@ -77,20 +133,9 @@ st.sidebar.title("SpendLens")
 api_key = st.sidebar.text_input("Gemini API key", value=os.getenv("GEMINI_API_KEY") or "",
                                 type="password", help="Free key: aistudio.google.com/app/apikey")
 currency = st.sidebar.text_input("Currency symbol (optional)", value="")
-source = st.sidebar.radio("Data source", ["Use sample (steel plant)", "Upload my CSV"])
+source = st.sidebar.radio("Data source", ["Use sample (steel plant)", "Upload my file"])
 
-def load_file(f):
-    name = f.name if hasattr(f, "name") else str(f)
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(f)
-    try:
-        return pd.read_csv(f)
-    except UnicodeDecodeError:
-        if hasattr(f, "seek"):
-            f.seek(0)
-        return pd.read_csv(f, encoding="latin-1")
-
-if source == "Upload my CSV":
+if source == "Upload my file":
     up = st.sidebar.file_uploader("Upload procurement data", type=["csv", "xlsx", "xls"])
     raw = load_file(up) if up is not None else None
 else:
@@ -101,7 +146,7 @@ st.title("SpendLens")
 st.caption("Turn messy procurement data into spend intelligence — any industry. After Li et al. (2025), INFORMS.")
 
 if raw is None:
-    st.info("⬅ Upload a CSV in the sidebar, or switch to the sample, to begin.")
+    st.info("⬅ Upload a file in the sidebar, or switch to the sample, to begin.")
     st.stop()
 
 # column mapping
@@ -110,10 +155,18 @@ def guess(keys):
     for i, c in enumerate(cols):
         if any(k in c.lower() for k in keys): return i
     return 0
+qty_options = ["— none —"] + cols
+def guess_qty():
+    for c in cols:
+        if any(k in c.lower() for k in ["qty", "quantity", "units", "order_qty"]):
+            return qty_options.index(c)
+    return 0
+
 st.sidebar.markdown("**Map your columns**")
 sup_col  = st.sidebar.selectbox("Supplier name", cols, index=guess(["supplier", "vendor"]))
 desc_col = st.sidebar.selectbox("Item description", cols, index=guess(["item", "desc", "product", "material"]))
 amt_col  = st.sidebar.selectbox("Amount / spend", cols, index=guess(["invoice", "amount", "value", "spend", "price", "cost"]))
+qty_col  = st.sidebar.selectbox("Quantity (optional — unlocks price analysis)", qty_options, index=guess_qty())
 run = st.sidebar.button("Run analysis", type="primary")
 
 # ================================ RUN PIPELINE ================================
@@ -124,8 +177,10 @@ if run:
     work = raw[[sup_col, desc_col, amt_col]].copy()
     work.columns = ["supplier_raw", "item_desc", "amount"]
     work["amount"] = pd.to_numeric(
-        work["amount"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
-        errors="coerce")
+        work["amount"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+    if qty_col != "— none —":
+        work["qty"] = pd.to_numeric(
+            raw[qty_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
     work = work.dropna(subset=["amount", "supplier_raw", "item_desc"])
     work["supplier_raw"] = work["supplier_raw"].astype(str)
     work["item_desc"] = work["item_desc"].astype(str)
@@ -136,7 +191,9 @@ if run:
         try:
             catmap = classify_with_llm(sorted(work["item_desc"].unique()), api_key)
         except Exception as e:
-            st.error(f"AI classification failed: {e}\nCheck your key, or try model 'gemini-3.5-flash'.")
+            st.error(f"AI classification failed: {e}\n\n"
+                     "If this is a quota/limit error, wait a few minutes and click Run once more "
+                     "(each click uses some of the free-tier allowance).")
             st.stop()
         work["category"] = work["item_desc"].map(lambda d: catmap.get(d, "Uncategorized"))
     st.session_state["work"] = work
@@ -153,7 +210,7 @@ if "work" in st.session_state:
     a.metric("Total spend", fmt(total, currency))
     b.metric("Suppliers consolidated", f"{work.supplier_raw.nunique()} → {work.supplier.nunique()}")
     c.metric("Categories found", f"{summary.shape[0]}")
-    d.metric("Est. savings", f"{fmt(low, currency)}–{fmt(high, currency)}")
+    d.metric("Est. leverage savings", f"{fmt(low, currency)}–{fmt(high, currency)}")
     st.divider()
 
     st.subheader("Kraljic leverage map")
@@ -179,6 +236,57 @@ if "work" in st.session_state:
                .sort_values(ascending=False)).rename("Spend").to_frame()
         alt["Spend"] = alt["Spend"].map(lambda v: fmt(v, currency))
         st.dataframe(alt, use_container_width=True)
+
+    # ---- Savings opportunity: price consistency ----
+    st.divider()
+    st.subheader("💸 Savings opportunity — price consistency")
+    pv = price_variance(work)
+    if pv is None:
+        st.info("Map a **Quantity** column in the sidebar (then press Run again) to unlock this — "
+                "it needs unit price = amount ÷ quantity.")
+    else:
+        recoverable = pv["Recoverable"].sum()
+        st.caption("Items bought above their normal (median) unit price. 'Recoverable' = the premium paid "
+                   "above the median on the overpriced orders — a conservative, defensible target, not a "
+                   "fantasy best-price figure.")
+        st.metric("Recoverable from price consistency", fmt(recoverable, currency))
+        show = pv.head(15).copy()
+        show["Median unit price"] = show["Median unit price"].map(lambda v: fmt(v, currency))
+        show["Max unit price"] = show["Max unit price"].map(lambda v: fmt(v, currency))
+        show["Spread"] = show["Spread"].map(lambda v: f"{v:.1f}×")
+        show["Recoverable"] = show["Recoverable"].map(lambda v: fmt(v, currency))
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    # ---- Savings opportunity: tail-spend consolidation ----
+    st.divider()
+    st.subheader("📦 Savings opportunity — tail-spend consolidation")
+    ts = tail_spend(work)
+    st.caption("A few suppliers carry most of your spend; a long tail of small suppliers adds admin cost, "
+               "weak leverage, and maverick-spend risk. Consolidating the tail is a classic quick win.")
+    n_tail = ts["n_tail"]
+    tail_pct = ts["tail_pct_suppliers"]
+    tail_spend_pct = ts["tail_spend_pct"]
+    tail_spend_val = fmt(ts["tail_spend"], currency)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total suppliers", ts["n_total"])
+    m2.metric("Carry ~80% of spend", ts["n_head"])
+    m3.metric("Tail suppliers", f"{n_tail} ({tail_pct:.0%})",
+              help=f"The tail is only {tail_spend_pct:.0%} of spend = {tail_spend_val}")
+    prof = ts["profile"]
+    seg_colors = ["#2e9e6f" if s == "Head" else "#7a838f" for s in prof["segment"]]
+    pareto = go.Figure()
+    pareto.add_bar(x=prof["rank"], y=prof["spend"], marker_color=seg_colors, name="Supplier spend",
+                   customdata=prof["supplier"], hovertemplate="%{customdata}<br>%{y:,.0f}<extra></extra>")
+    pareto.add_scatter(x=prof["rank"], y=prof["cum_pct"] * 100, yaxis="y2", mode="lines+markers",
+                       line=dict(color="#e0922f"), name="Cumulative %")
+    pareto.add_scatter(x=[1, ts["n_total"]], y=[80, 80], yaxis="y2", mode="lines",
+                       line=dict(dash="dash", color="#d9534f"), name="80% line")
+    pareto.update_layout(height=420,
+                         xaxis=dict(title="Suppliers ranked by spend (1 = biggest)"),
+                         yaxis=dict(title="Spend"),
+                         yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]),
+                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    st.plotly_chart(pareto, use_container_width=True)
 
     st.divider()
     st.download_button("⬇ Download cleaned + classified data (CSV)",
