@@ -66,7 +66,24 @@ def classify_with_llm(descriptions, api_key, model="gemini-2.5-flash"):
         model=model, contents=prompt,
         config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"))
     return json.loads(resp.text)
-
+def resolve_suppliers_llm(names, api_key, model="gemini-2.5-flash"):
+    """Merge names that are the SAME real-world company using the LLM's world
+    knowledge (e.g. 'KBL' = 'Kirloskar Brothers Limited'). In-context clustering,
+    after Fu et al. (2025) and Peeters et al. (2025) — catches aliases fuzzy can't."""
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    prompt = ("Below are supplier/company names from purchasing records, already partly "
+              "de-duplicated. Some still refer to the SAME real-world company via abbreviations "
+              "or aliases (e.g. 'KBL' = 'Kirloskar Brothers Limited', 'L&T' = 'Larsen & Toubro'). "
+              "Using your world knowledge, cluster names that are the same company.\n"
+              "Return ONLY a JSON object mapping EACH input name to one canonical company name "
+              "(use the most complete, formal name as canonical).\n\nNames:\n"
+              + json.dumps(sorted(names), indent=2))
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"))
+    return json.loads(resp.text)
 def analyze(work):
     s = work.groupby("category").agg(
         total_spend=("amount", "sum"), n_suppliers=("supplier", "nunique"),
@@ -133,6 +150,7 @@ st.sidebar.title("SpendLens")
 api_key = st.sidebar.text_input("Gemini API key", value=os.getenv("GEMINI_API_KEY") or "",
                                 type="password", help="Free key: aistudio.google.com/app/apikey")
 currency = st.sidebar.text_input("Currency symbol (optional)", value="")
+ai_resolve = st.sidebar.checkbox("AI supplier resolution (merge abbreviations)", value=True)
 source = st.sidebar.radio("Data source", ["Use sample (steel plant)", "Upload my file"])
 
 if source == "Upload my file":
@@ -187,6 +205,13 @@ if run:
 
     with st.spinner("Consolidating suppliers..."):
         work["supplier"] = work["supplier_raw"].map(consolidate_suppliers(work["supplier_raw"].unique()))
+    if ai_resolve:
+        with st.spinner("Resolving abbreviations & aliases with AI..."):
+            try:
+                fmap = resolve_suppliers_llm(work["supplier"].unique(), api_key)
+                work["supplier"] = work["supplier"].map(lambda s: fmap.get(s, s))
+            except Exception as e:
+                st.warning(f"AI supplier resolution skipped ({e}). Using fuzzy matching only.")
     with st.spinner("Classifying spend with AI (this is the slow bit)..."):
         try:
             catmap = classify_with_llm(sorted(work["item_desc"].unique()), api_key)
