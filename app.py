@@ -144,6 +144,79 @@ def fmt(v, sym=""):
     if a >= 1e6: return f"{sym}{v/1e6:.2f}M"
     if a >= 1e3: return f"{sym}{v/1e3:.1f}K"
     return f"{sym}{v:.0f}"
+def sourcing_strategist(summary, work, api_key, currency="", risk_brief="", model="gemini-2.5-flash"):
+    """A Sourcing Strategist 'agent': reads the spend analysis and drafts a
+    decision-ready sourcing brief. The first agent of a multi-agent design
+    (after Jannelli & Brintrup, 2025) — the pipeline above is the Spend Analyst."""
+    from google import genai
+    from google.genai import types
+    cat_lines = [f"- {r['category']}: spend {fmt(r['total_spend'], currency)}, "
+                 f"{int(r['n_suppliers'])} suppliers, quadrant {r['quadrant']}"
+                 for _, r in summary.iterrows()]
+    lev_cats = list(summary[summary["quadrant"] == "Leverage"]["category"])
+    sup_lines = []
+    for c in lev_cats:
+        s = (work[work["category"] == c].groupby("supplier")["amount"].sum()
+             .sort_values(ascending=False).head(5))
+        sup_lines.append(f"{c}: " + ", ".join(f"{n} ({fmt(v, currency)})" for n, v in s.items()))
+    digest = ("Spend by category:\n" + "\n".join(cat_lines) +
+              "\n\nLeverage categories (best renegotiation targets) and their suppliers:\n" +
+              ("\n".join(sup_lines) if sup_lines else "none"))
+    prompt = ("You are a procurement Sourcing Strategist. Based ONLY on the spend analysis below, "
+              "write a concise, decision-ready sourcing brief for a category manager, in markdown, "
+              "with these sections:\n"
+              "1. Top 3 opportunities (which categories/suppliers, and why).\n"
+              "2. Recommended action for each (e.g. run a competitive RFQ, consolidate suppliers, renegotiate).\n"
+              "3. A suggested RFQ shortlist where relevant.\n"
+              "4. One negotiation angle per opportunity.\n"
+              "Be specific and practical. Do NOT invent data that is not in the analysis.\n\n"
+              "ANALYSIS:\n" + digest)
+    if risk_brief:
+        prompt += ("\n\nSUPPLIER RISK ASSESSMENT (factor this in; do NOT recommend aggressive "
+                   "renegotiation or sole-source consolidation where risk is high):\n" + risk_brief)
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3))
+    return resp.text
+
+
+def _risk_metrics(summary, work, currency=""):
+    lines, single = [], 0
+    for _, r in summary.sort_values("total_spend", ascending=False).iterrows():
+        cat = r["category"]
+        g = work[work["category"] == cat].groupby("supplier")["amount"].sum().sort_values(ascending=False)
+        top_share = (g.iloc[0] / g.sum()) if len(g) else 0
+        top_name = g.index[0] if len(g) else "n/a"
+        flag = "SINGLE-SOURCE" if r["n_suppliers"] == 1 else ("CONCENTRATED" if top_share >= 0.7 else "")
+        if r["n_suppliers"] == 1:
+            single += 1
+        lines.append(f"- {cat}: spend {fmt(r['total_spend'], currency)}, {int(r['n_suppliers'])} suppliers, "
+                     f"top supplier {top_name} {top_share:.0%} {flag}".rstrip())
+    total = work["amount"].sum()
+    dep = (work.groupby("supplier")["amount"].sum().sort_values(ascending=False).head(5) / total)
+    dep_lines = [f"- {n}: {v:.0%} of total spend" for n, v in dep.items()]
+    return (f"Categories: {len(summary)}; single-source categories: {single}\n\n"
+            "Per-category supply risk:\n" + "\n".join(lines) +
+            "\n\nMost depended-on suppliers:\n" + "\n".join(dep_lines))
+
+
+def supplier_risk_agent(summary, work, api_key, currency="", model="gemini-2.5-flash"):
+    """A Supplier Risk agent: flags single-source / concentrated categories and
+    over-dependence on individual suppliers (after Jannelli & Brintrup, 2025)."""
+    from google import genai
+    from google.genai import types
+    digest = _risk_metrics(summary, work, currency)
+    prompt = ("You are a procurement Supplier Risk analyst. Based ONLY on the supply-risk signals below, "
+              "identify the top supply risks: single-source or highly concentrated categories, and "
+              "over-dependence on individual suppliers. For each, name the category/supplier, why it is "
+              "risky, and the potential business impact. Be concise, in markdown. Do NOT invent data.\n\n"
+              "SUPPLY-RISK SIGNALS:\n" + digest)
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3))
+    return resp.text
 
 # ================================ SIDEBAR ================================
 st.sidebar.title("SpendLens")
@@ -220,10 +293,31 @@ if run:
                      "If this is a quota/limit error, wait a few minutes and click Run once more "
                      "(each click uses some of the free-tier allowance).")
             st.stop()
-        work["category"] = work["item_desc"].map(lambda d: catmap.get(d, "Uncategorized"))
-    st.session_state["work"] = work
-    st.session_state["summary"] = analyze(work)
+        st.session_state["work_base"] = work
+    uniq = sorted(work["item_desc"].unique())
+    st.session_state["cat_df"] = pd.DataFrame(
+        {"item_desc": uniq, "category": [catmap.get(d, "Uncategorized") for d in uniq]})
+    st.session_state.pop("work", None)
+    st.session_state.pop("summary", None)
 
+# ======================= REVIEW & CORRECT CATEGORIES (human in the loop) =======================
+if "work_base" in st.session_state and "cat_df" in st.session_state:
+    st.subheader("Review & correct the AI's categories")
+    st.caption("The AI assigned each unique item to a category. Fix any it got wrong, then analyse — "
+               "you stay in control of the classification (after Spina et al., 2025).")
+    cats = sorted(st.session_state["cat_df"]["category"].unique())
+    edited = st.data_editor(
+        st.session_state["cat_df"], key="cat_editor", use_container_width=True, hide_index=True,
+        column_config={
+            "item_desc": st.column_config.TextColumn("Item description", disabled=True),
+            "category": st.column_config.SelectboxColumn("Category", options=cats, required=True),
+        })
+    if st.button("Apply corrections & analyze", type="primary"):
+        mapping = dict(zip(edited["item_desc"], edited["category"]))
+        wb = st.session_state["work_base"].copy()
+        wb["category"] = wb["item_desc"].map(lambda d: mapping.get(d, "Uncategorized"))
+        st.session_state["work"] = wb
+        st.session_state["summary"] = analyze(wb)
 # ================================ DASHBOARD ================================
 if "work" in st.session_state:
     work, summary = st.session_state["work"], st.session_state["summary"]
@@ -316,5 +410,29 @@ if "work" in st.session_state:
     st.divider()
     st.download_button("⬇ Download cleaned + classified data (CSV)",
                        work.to_csv(index=False).encode("utf-8"), "spendlens_output.csv", "text/csv")
-else:
+    st.divider()
+    st.subheader("🤖 Multi-agent sourcing — from analysis to action")
+    st.caption("Two agents work in sequence: a Supplier Risk agent flags supply risks, then a Sourcing "
+               "Strategist drafts risk-aware recommendations (after Jannelli & Brintrup, 2025).")
+    if st.button("Run sourcing agents"):
+        if not api_key:
+            st.error("Need your Gemini API key (sidebar) to run the agents.")
+        else:
+            try:
+                with st.spinner("Supplier Risk agent assessing supply risk..."):
+                    st.session_state["risk_brief"] = supplier_risk_agent(summary, work, api_key, currency)
+                with st.spinner("Sourcing Strategist drafting risk-aware brief..."):
+                    st.session_state["brief"] = sourcing_strategist(
+                        summary, work, api_key, currency, risk_brief=st.session_state["risk_brief"])
+            except Exception as e:
+                st.error(f"Agent failed: {e}  (if this is a quota limit, wait a few minutes and retry).")
+    if st.session_state.get("risk_brief"):
+        st.markdown("### 🛡️ Supplier Risk assessment")
+        st.markdown(st.session_state["risk_brief"])
+    if st.session_state.get("brief"):
+        st.markdown("### 📋 Sourcing Strategist brief (risk-aware)")
+        st.markdown(st.session_state["brief"])
+        st.download_button("⬇ Download sourcing brief (Markdown)",
+                           st.session_state["brief"].encode("utf-8"), "sourcing_brief.md", "text/markdown")
+elif "work_base" not in st.session_state:
     st.info("Set your key, map your columns, and press **Run analysis** in the sidebar.")
